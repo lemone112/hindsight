@@ -66,10 +66,15 @@ function readSessionCacheRecord(cacheFile: string): CacheRead {
 }
 
 /** Порядок ключей JSON не меняет область. Профиль локального daemon различает его базы. */
-export function memoryScopeFingerprint(cfg: Config, bank: string | undefined): string {
+export function memoryScopeFingerprint(
+  cfg: Config,
+  bank: string | undefined,
+  apiUrl = cfg.apiUrl
+): string {
   const body = JSON.stringify(
     {
-      endpoint: cfg.apiUrl.replace(/\/+$/, ""),
+      // Нормализация принадлежит HTTP-клиенту: его фактический endpoint сохраняется точно.
+      endpoint: apiUrl,
       bank: bank ?? null,
       credential: cfg.apiToken ?? null,
       daemonProfile: cfg.serverMode === "daemon" ? cfg.daemonProfile : null,

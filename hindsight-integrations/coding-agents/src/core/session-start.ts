@@ -50,6 +50,7 @@ import {
 
 /** Minimal client shape `buildSessionStartContext` needs. */
 interface SeedContextClient {
+  readonly apiUrl?: string;
   listDocumentIds(tag: string, tagsMatch?: "all" | "all_strict"): Promise<Set<string>>;
   // Optional: lets the git note see a git-log document written at a commit HEAD is behind
   // (gitLogIsCurrent). The minimal test clients omit it and keep the exact-HEAD check.
@@ -449,7 +450,7 @@ export async function runSessionStartHook(
     });
 
     const out = await buildSessionStartContext({ cwd, sessionRoot, bankId, cfg, client, harness });
-    const memoryScope = memoryScopeFingerprint(cfg, bankId);
+    const memoryScope = memoryScopeFingerprint(cfg, bankId, client.apiUrl);
     const cacheFile = sessionId ? sessionCacheFile(harness, sessionId) : undefined;
     const read = cacheFile ? readScopedSessionCache(cacheFile, memoryScope) : undefined;
     if (source === "compact") {

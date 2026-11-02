@@ -88,6 +88,7 @@ export interface HookSpec {
 
 /** Minimal client shape `buildHookOutput` needs — `HindsightClient` satisfies it structurally. */
 interface HookClient {
+  readonly apiUrl?: string;
   reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string>;
   listPages(): Promise<unknown>;
   searchKnowledgePages(
@@ -239,7 +240,7 @@ export async function buildHookOutput(args: {
 }): Promise<HookOutput> {
   const { harness, prompt, cfg, client, cacheFile } = args;
 
-  const memoryScope = memoryScopeFingerprint(cfg, client.bank);
+  const memoryScope = memoryScopeFingerprint(cfg, client.bank, client.apiUrl);
   const read = readScopedSessionCache(cacheFile, memoryScope);
   const cached = read.cache;
   if (read.status !== "valid" && read.status !== "missing")

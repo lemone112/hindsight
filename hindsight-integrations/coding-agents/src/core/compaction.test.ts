@@ -7,7 +7,7 @@ import { buildHookOutput } from "./hook";
 import { runSessionStartHook } from "./session-start";
 import { sessionCacheFile } from "./session-cache";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
-import type { ClientOpts } from "./hindsight";
+import { HindsightClient, type ClientOpts } from "./hindsight";
 
 let stdin = "";
 let rawConfig: RawConfig;
@@ -43,7 +43,9 @@ afterEach(() => {
       rmSync(sessionCacheFile(harness, session).replace(/\.json$/, suffix), { force: true });
 });
 
-const promptClient = (bank = "actual-bank") => ({ bank, reflect: vi.fn(async () => FACT),
+const promptClient = (bank = "actual-bank") => ({ bank,
+  apiUrl: new HindsightClient({ apiUrl: resolveConfig(rawConfig).apiUrl, bank }).apiUrl,
+  reflect: vi.fn(async () => FACT),
   listPages: vi.fn(async () => ({ items: [{ id: "p1", name: "Decision" }] })),
   searchKnowledgePages: vi.fn(async () => []), recallObservations: vi.fn(async () => []) });
 async function firstPrompt(harness = "claude-code") {
@@ -59,7 +61,7 @@ async function compact(harness: "claude-code" | "codex" = "claude-code", source 
   const client = { listDocumentIds: vi.fn(async () => new Set<string>()),
     listPages: vi.fn(async () => ({ items: [{ id: "p2", name: "New roster" }] })) };
   const write = vi.spyOn(process.stdout, "write").mockReturnValue(true);
-  const makeClient = vi.fn((_opts: ClientOpts) => client);
+  const makeClient = vi.fn((opts: ClientOpts) => ({ ...client, apiUrl: new HindsightClient(opts).apiUrl }));
   await runSessionStartHook(HOOK_HARNESSES[harness].sessionStart, makeClient);
   const stdout = write.mock.calls.map(([value]) => String(value)).join("");
   write.mockRestore();
@@ -154,5 +156,33 @@ describe("native compact cached memory", () => {
     await buildHookOutput({ harness: "claude-code", prompt: "Continue", cfg: resolveConfig(rawConfig), client,
       cacheFile: sessionCacheFile("claude-code", session) });
     expect(client.reflect).toHaveBeenCalledTimes(1);
+  });
+  it("rejects endpoints whose actual client targets differ by a trailing slash", async () => {
+    rawConfig.apiUrl = "http://127.0.0.1:8888/team/";
+    await firstPrompt();
+    const old = new HindsightClient({ apiUrl: rawConfig.apiUrl, bank: "actual-bank" });
+    rawConfig.apiUrl += "/";
+    const current = new HindsightClient({ apiUrl: rawConfig.apiUrl, bank: "actual-bank" });
+    expect(current.bankUrl("/reflect")).not.toBe(old.bankUrl("/reflect"));
+    const { out } = await compact();
+    expect(context(out)).not.toContain(FACT);
+    expect(out.systemMessage).toContain("scope_mismatch");
+    const client = promptClient();
+    await buildHookOutput({ harness: "claude-code", prompt: "Continue", cfg: resolveConfig(rawConfig), client,
+      cacheFile: sessionCacheFile("claude-code", session) });
+    expect(client.reflect).toHaveBeenCalledTimes(1);
+  });
+  it("preserves cache for equivalent actual client targets", async () => {
+    rawConfig.apiUrl = "http://127.0.0.1:8888/team/";
+    await firstPrompt();
+    const old = new HindsightClient({ apiUrl: rawConfig.apiUrl, bank: "actual-bank" });
+    rawConfig.apiUrl = "http://127.0.0.1:8888/team";
+    const current = new HindsightClient({ apiUrl: rawConfig.apiUrl, bank: "actual-bank" });
+    expect(current.bankUrl("/reflect")).toBe(old.bankUrl("/reflect"));
+    expect(context((await compact()).out)).toContain(FACT);
+    const client = promptClient();
+    await buildHookOutput({ harness: "claude-code", prompt: "Continue", cfg: resolveConfig(rawConfig), client,
+      cacheFile: sessionCacheFile("claude-code", session) });
+    expect(client.reflect).not.toHaveBeenCalled();
   });
 });
