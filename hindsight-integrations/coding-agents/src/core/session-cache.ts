@@ -4,11 +4,15 @@ import { dirname, join } from "node:path";
 import type { PageRef } from "./knowledge-injection";
 import type { RetainCursor, RetainCursorStore } from "./retain-cursor";
 import type { UsageCursorStore } from "./usage";
+import { createHash } from "node:crypto";
+import type { Config } from "./config";
 
 /** Process-shared state for hook harnesses. SessionStart and prompt hooks are separate Node
  * processes, so this temp-file handoff carries lifecycle decisions without writing user config or
  * bank state. */
 export interface SessionCache {
+  /** Отпечаток фактического банка, подключения и области чтения; секрет в файл не попадает. */
+  memoryScope?: string;
   turns?: number;
   reflectAnswer?: string; // present (even "") = reflect already resolved this session
   /** How many times auto-inject has been ATTEMPTED this session — every source, not just reflect.
@@ -26,11 +30,72 @@ export function sessionCacheFile(harness: string, sessionId: string): string {
 }
 
 export function readSessionCache(cacheFile: string): SessionCache {
+  return readSessionCacheRecord(cacheFile).cache;
+}
+
+type CacheRead = {
+  cache: SessionCache;
+  status: "valid" | "missing" | "invalid" | "legacy" | "scope_mismatch";
+};
+function readSessionCacheRecord(cacheFile: string): CacheRead {
   try {
-    return JSON.parse(readFileSync(cacheFile, "utf8")) as SessionCache;
-  } catch {
-    return {};
+    const raw = JSON.parse(readFileSync(cacheFile, "utf8"));
+    const count = (n: unknown) =>
+      n === undefined || (typeof n === "number" && Number.isSafeInteger(n) && n >= 0);
+    if (
+      !raw || typeof raw !== "object" || Array.isArray(raw) ||
+      (raw.reflectAnswer !== undefined && typeof raw.reflectAnswer !== "string") ||
+      (raw.memoryScope !== undefined && typeof raw.memoryScope !== "string") ||
+      (raw.deferInitialReflect !== undefined && typeof raw.deferInitialReflect !== "boolean") ||
+      !count(raw.turns) || !count(raw.reflectAttempts) ||
+      (raw.pages !== undefined && (
+        !raw.pages || !count(raw.pages.atTurn) || !Array.isArray(raw.pages.list) ||
+        raw.pages.list.some((p: unknown) =>
+          !p || typeof p !== "object" || typeof (p as PageRef).id !== "string" ||
+          typeof (p as PageRef).title !== "string")
+      ))
+    )
+      return { cache: {}, status: "invalid" };
+    return { cache: raw, status: "valid" };
+  } catch (error) {
+    return {
+      cache: {},
+      status: (error as NodeJS.ErrnoException)?.code === "ENOENT" ? "missing" : "invalid",
+    };
   }
+}
+
+/** Порядок ключей JSON не меняет область. Профиль локального daemon различает его базы. */
+export function memoryScopeFingerprint(cfg: Config, bank: string | undefined): string {
+  const body = JSON.stringify(
+    {
+      endpoint: cfg.apiUrl.replace(/\/+$/, ""),
+      bank: bank ?? null,
+      credential: cfg.apiToken ?? null,
+      daemonProfile: cfg.serverMode === "daemon" ? cfg.daemonProfile : null,
+      autoInject: cfg.autoInject,
+      observationScopes: cfg.observationScopes,
+      recallOptions: cfg.recallOptions,
+      pageSearchLimit: cfg.pageSearchLimit,
+    },
+    (_key, value) =>
+      value && typeof value === "object" && !Array.isArray(value)
+        ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, value[key]]))
+        : value
+  );
+  return `v1:${createHash("sha256").update(body).digest("hex")}`;
+}
+
+/** Ни ответ, ни завершённая попытка, ни roster из другой области не должны подавить новое чтение. */
+export function readScopedSessionCache(cacheFile: string, memoryScope: string): CacheRead {
+  const read = readSessionCacheRecord(cacheFile);
+  if (read.status !== "valid") return read;
+  if (!read.cache.memoryScope) {
+    // Старый cold-bank marker не содержит фактов и сохраняет прежнюю отсрочку первого чтения.
+    return { cache: { deferInitialReflect: read.cache.deferInitialReflect }, status: "legacy" };
+  }
+  if (read.cache.memoryScope !== memoryScope) return { cache: {}, status: "scope_mismatch" };
+  return read;
 }
 
 /**

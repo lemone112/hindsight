@@ -42,7 +42,8 @@ import {
 import type { PageRef } from "./knowledge-injection";
 import { buildRosterRefresh, parsePageList } from "./knowledge-injection";
 import {
-  readSessionCache,
+  memoryScopeFingerprint,
+  readScopedSessionCache,
   sessionCacheFile,
   sessionRootDir,
   stashPendingContext,
@@ -238,7 +239,11 @@ export async function buildHookOutput(args: {
 }): Promise<HookOutput> {
   const { harness, prompt, cfg, client, cacheFile } = args;
 
-  const cached = readSessionCache(cacheFile);
+  const memoryScope = memoryScopeFingerprint(cfg, client.bank);
+  const read = readScopedSessionCache(cacheFile, memoryScope);
+  const cached = read.cache;
+  if (read.status !== "valid" && read.status !== "missing")
+    diag(harness, "memory_cache_invalidated", { reason: read.status });
   const turns = (cached.turns ?? 0) + 1;
 
   // ── auto-inject: once per session, on the first prompt ────────────────────────
@@ -367,6 +372,7 @@ export async function buildHookOutput(args: {
   }
 
   writeSessionCache(cacheFile, {
+    memoryScope,
     turns,
     reflectAnswer,
     reflectAttempts,
@@ -377,8 +383,9 @@ export async function buildHookOutput(args: {
   // Hook-injected context lands in the USER MESSAGE and persists in the transcript — unlike a
   // system prompt, it accumulates. The reflect block is injected exactly ONCE, the turn reflect
   // ran. No cadence re-injection: replaying the turn-1 synthesis at arbitrary later turns reads
-  // as random noise once the session drifts, and the agent holds hindsight_reflect for a FRESH
-  // pass if compaction or drift makes it need memory again.
+  // as random noise once the session drifts.
+  // Native SessionStart(compact) отдельно восстанавливает кэш; hindsight_reflect доступен
+  // для нового чтения, когда текущей задаче нужна свежая память.
   if (reflectAnswer && reflectRanThisTurn) blocks.push(buildSystemInjection(reflectAnswer));
   // Knowledge pages are NOT auto-injected: the agent pulls them through
   // hindsight_search_knowledge_pages when a question warrants it — an unprompted injection on

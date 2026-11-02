@@ -7,6 +7,7 @@ import { buildHookOutput, runHook } from "./hook";
 import { diagFilePath } from "./diag";
 import { ReflectError } from "./hindsight";
 import { buildReflectQuery } from "./inject";
+import { memoryScopeFingerprint } from "./session-cache";
 
 let root: string;
 let cacheFile: string;
@@ -810,6 +811,7 @@ describe("buildHookOutput", () => {
       JSON.stringify({
         turns: 1,
         reflectAnswer: "CACHED",
+        memoryScope: memoryScopeFingerprint(cfg, undefined),
         pages: { atTurn: 1, list: [{ id: "p1", title: "Uploader guide", content: PAGE_CONTENT }] },
       })
     );

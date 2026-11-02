@@ -31,7 +31,8 @@ import { DAEMON_WAIT_SESSION_START_MS, ensureDaemon } from "./daemon";
 import type { Config } from "./config";
 import { deriveBankIdOrSkip } from "./bank";
 import { brandWord } from "./brand";
-import { diag, readHookEvent } from "./diag";
+import { diag, diagFilePath, readHookEvent } from "./diag";
+import { buildSystemInjection } from "./inject";
 import { setLogLevel } from "./log";
 import { parsePageList, buildKnowledgePreamble, type PageRef } from "./knowledge-injection";
 import type { ClientOpts, RetainOpts } from "./hindsight";
@@ -40,6 +41,8 @@ import { detectLegacyClaudePlugin, legacyClaudePluginWarning } from "./legacy";
 import { HindsightClient } from "./hindsight";
 import {
   sessionCacheFile,
+  memoryScopeFingerprint,
+  readScopedSessionCache,
   sessionRootDir,
   stashPendingContext,
   writeSessionCache,
@@ -139,7 +142,7 @@ export interface SessionStartOutput {
  * Claude-compatible envelope; Cursor's native hooks require snake-case `additional_context`. */
 export interface SessionStartHookSpec {
   harness: string;
-  parse(event: Record<string, unknown>): { cwd?: string; sessionId?: string };
+  parse(event: Record<string, unknown>): { cwd?: string; sessionId?: string; source?: string };
   /** Optional event gate, evaluated before config loading: false makes the hook a silent no-op. */
   accept?(event: Record<string, unknown>): boolean;
   emit(output: SessionStartOutput): unknown;
@@ -407,7 +410,7 @@ export async function runSessionStartHook(
     if (!ev) return;
     if (spec.accept && !spec.accept(ev)) return;
     const { harness } = spec;
-    const { cwd: rawCwd, sessionId } = spec.parse(ev);
+    const { cwd: rawCwd, sessionId, source } = spec.parse(ev);
     const cwd = rawCwd || process.cwd();
 
     let cfg = loadConfig({ harness });
@@ -446,12 +449,42 @@ export async function runSessionStartHook(
     });
 
     const out = await buildSessionStartContext({ cwd, sessionRoot, bankId, cfg, client, harness });
+    const memoryScope = memoryScopeFingerprint(cfg, bankId);
+    const cacheFile = sessionId ? sessionCacheFile(harness, sessionId) : undefined;
+    const read = cacheFile ? readScopedSessionCache(cacheFile, memoryScope) : undefined;
+    if (source === "compact") {
+      const answer = read?.cache.reflectAnswer;
+      const reason = cfg.autoInject === "none" ? "auto_inject_off"
+        : !sessionId ? "no_session"
+        : read?.status !== "valid" ? read?.status
+        : answer === undefined ? "unresolved"
+        : !answer.trim() ? "empty"
+        : undefined;
+      if (!reason && answer) {
+        // Compact может продолжить тот же turn без UserPromptSubmit: восстановление нужно здесь.
+        const restored = buildSystemInjection(
+          "(Restored from this session's earlier retrieval; no new memory query.)\n" + answer
+        );
+        out.additionalContext = [out.additionalContext, restored].filter(Boolean).join("\n\n");
+        diag(harness, "compact_memory_restored", { chars: answer.length });
+      } else {
+        diag(harness, "compact_memory_not_restored", { reason });
+        out.systemMessage = [
+          out.systemMessage,
+          `${brandWord()} · memory not restored after compaction (${reason}) — see ${diagFilePath()}`,
+        ].filter(Boolean).join("\n");
+      }
+    }
     // The registration's banner hint (e.g. TraeCode's workspace-MCP gate) rides the same
     // user-facing message as the legacy-plugin warning — the banner is the only visible channel.
     if (mcpHint)
       out.systemMessage = out.systemMessage ? `${out.systemMessage}\n${mcpHint}` : mcpHint;
-    if (out.deferInitialReflect && sessionId) {
-      writeSessionCache(sessionCacheFile(harness, sessionId), { deferInitialReflect: true });
+    if (out.deferInitialReflect && cacheFile) {
+      writeSessionCache(cacheFile, {
+        ...read?.cache,
+        memoryScope,
+        deferInitialReflect: read?.cache.reflectAnswer === undefined ? true : undefined,
+      });
     }
     if (spec.deferContextToToolHook && out.additionalContext && sessionId) {
       stashPendingContext(harness, sessionId, out.additionalContext);

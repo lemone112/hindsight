@@ -222,6 +222,7 @@ const standardSessionStart = (harness: string): SessionStartHookSpec => ({
   parse: (ev) => ({
     cwd: ev.cwd as string | undefined,
     sessionId: ev.session_id as string | undefined,
+    source: typeof ev.source === "string" ? ev.source : undefined,
   }),
   emit: (out) => ({
     ...(out.systemMessage ? { systemMessage: out.systemMessage } : {}),
