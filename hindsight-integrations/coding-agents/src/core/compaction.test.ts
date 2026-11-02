@@ -6,6 +6,7 @@ import { resolveConfig, type RawConfig } from "./config";
 import { buildHookOutput } from "./hook";
 import { runSessionStartHook } from "./session-start";
 import { sessionCacheFile } from "./session-cache";
+import { memoryScopeFingerprint } from "./session-cache";
 import { HOOK_HARNESSES } from "../harness/hook-lifecycle";
 import { HindsightClient, type ClientOpts } from "./hindsight";
 
@@ -184,5 +185,43 @@ describe("native compact cached memory", () => {
     await buildHookOutput({ harness: "claude-code", prompt: "Continue", cfg: resolveConfig(rawConfig), client,
       cacheFile: sessionCacheFile("claude-code", session) });
     expect(client.reflect).not.toHaveBeenCalled();
+  });
+  it("never lets an unbound legacy cold marker suppress a changed warm bank", async () => {
+    const file = sessionCacheFile("claude-code", session);
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(file, JSON.stringify({ deferInitialReflect: true }));
+    rawConfig.banks = { "configured-bank": { bank: "other-bank" } };
+    const { out } = await compact();
+    expect(out.systemMessage).toContain("legacy");
+    const client = promptClient("other-bank");
+    const first = await buildHookOutput({ harness: "claude-code", prompt: "Read this warm bank",
+      cfg: resolveConfig(rawConfig), client, cacheFile: file });
+    expect(client.reflect).toHaveBeenCalledTimes(1);
+    expect(first.context).toContain(FACT);
+  });
+  it("honors a current scoped cold marker once, then retrieves", async () => {
+    const file = sessionCacheFile("claude-code", session);
+    mkdirSync(join(file, ".."), { recursive: true });
+    const cfg = resolveConfig(rawConfig);
+    const client = promptClient();
+    writeFileSync(file, JSON.stringify({ deferInitialReflect: true,
+      memoryScope: memoryScopeFingerprint(cfg, client.bank, client.apiUrl) }));
+    const first = await buildHookOutput({ harness: "claude-code", prompt: "Cold bank", cfg, client, cacheFile: file });
+    expect(client.reflect).not.toHaveBeenCalled();
+    expect(first.context).not.toContain(FACT);
+    await buildHookOutput({ harness: "claude-code", prompt: "Bank ready", cfg, client, cacheFile: file });
+    expect(client.reflect).toHaveBeenCalledTimes(1);
+  });
+  it("drops a scoped cold marker when the effective bank changes", async () => {
+    const file = sessionCacheFile("claude-code", session);
+    mkdirSync(join(file, ".."), { recursive: true });
+    const cfg = resolveConfig(rawConfig);
+    const old = promptClient();
+    writeFileSync(file, JSON.stringify({ deferInitialReflect: true,
+      memoryScope: memoryScopeFingerprint(cfg, old.bank, old.apiUrl) }));
+    const current = promptClient("other-bank");
+    await buildHookOutput({ harness: "claude-code", prompt: "Another warm bank", cfg,
+      client: current, cacheFile: file });
+    expect(current.reflect).toHaveBeenCalledTimes(1);
   });
 });

@@ -106,10 +106,11 @@ describe("buildHookOutput", () => {
   });
 
   it("defers the first automatic reflect for a new bank, then reflects on prompt two", async () => {
-    mkdirSync(join(root, "cache"), { recursive: true });
-    writeFileSync(cacheFile, JSON.stringify({ deferInitialReflect: true }));
     const cfg = resolveConfig({});
     const client = makeClient();
+    mkdirSync(join(root, "cache"), { recursive: true });
+    writeFileSync(cacheFile, JSON.stringify({ deferInitialReflect: true,
+      memoryScope: memoryScopeFingerprint(cfg, undefined) }));
 
     const first = await buildHookOutput({
       harness: "claude-code",

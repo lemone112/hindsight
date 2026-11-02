@@ -96,8 +96,8 @@ export function readScopedSessionCache(cacheFile: string, memoryScope: string): 
   const read = readSessionCacheRecord(cacheFile);
   if (read.status !== "valid") return read;
   if (!read.cache.memoryScope) {
-    // Старый cold-bank marker не содержит фактов и сохраняет прежнюю отсрочку первого чтения.
-    return { cache: { deferInitialReflect: read.cache.deferInitialReflect }, status: "legacy" };
+    // Даже отсрочка чтения принадлежит области: неизвестный старый банк не управляет новым.
+    return { cache: {}, status: "legacy" };
   }
   if (read.cache.memoryScope !== memoryScope) return { cache: {}, status: "scope_mismatch" };
   return read;
