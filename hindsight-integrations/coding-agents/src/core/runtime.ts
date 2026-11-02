@@ -32,14 +32,15 @@ import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
 import { buildHookOutput } from "./hook";
-import { memoryScopeFingerprint, sessionCacheFile, writeSessionCache } from "./session-cache";
+import { captureMemoryScope, memoryScopeUnchanged, sessionCacheFile, writeSessionCache,
+  type MemoryScopeSnapshot } from "./session-cache";
 
 const HARNESS = "opencode";
 /** How long `flush` holds a host's exit for in-flight write-backs: room for one retain request. */
 const FLUSH_TIMEOUT_MS = 10_000;
 
 export class RuntimeCore {
-  private readonly injection = new Map<string, string>(); // sessionId -> this turn's injection block
+  private readonly injection = new Map<string, { block: string; scope: MemoryScopeSnapshot }>();
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
@@ -50,7 +51,7 @@ export class RuntimeCore {
   private fetchTranscript?: (sessionId: string) => Promise<TransportTurn[]>;
   /** Write-backs started and not yet settled — what `flush` waits for. */
   private readonly inFlight = new Set<Promise<void>>();
-  private deferInitialReflect = false;
+  private deferInitialReflect?: MemoryScopeSnapshot;
   /** Host-notice channel (opencode/Kilo: client.tui.showToast via the adapter). Optional, fail-open. */
   private notify?: (title: string, message: string) => void;
 
@@ -138,6 +139,7 @@ export class RuntimeCore {
     // never got an update — the parity gap `ensureDaemon` above already had to be fixed for.
     void maybeAutoUpdate(this.cfg);
     try {
+      const scope = captureMemoryScope(this.cfg, this.client);
       const out = await buildSessionStartContext({
         cwd: repoPath || process.cwd(),
         bankId: this.bankId,
@@ -153,7 +155,8 @@ export class RuntimeCore {
         log.info(this.harness, plain);
         this.notify?.("Hindsight", plain.replace(/^Hindsight is /, "Is "));
       }
-      this.deferInitialReflect = out.deferInitialReflect === true;
+      this.deferInitialReflect = out.deferInitialReflect === true &&
+        memoryScopeUnchanged(scope, this.cfg, this.client) ? scope : undefined;
     } catch {
       /* seeding is best-effort — a cold-check failure never breaks the agent */
     }
@@ -180,11 +183,10 @@ export class RuntimeCore {
     if (this.deferInitialReflect) {
       // `seedIfCold` has no session id. Transfer its SessionStart decision to the first concrete
       // session here; `buildHookOutput` consumes it exactly once, like hook harnesses do.
-      this.deferInitialReflect = false;
-      writeSessionCache(cacheFile, {
-        deferInitialReflect: true,
-        memoryScope: memoryScopeFingerprint(this.cfg, this.client.bank, this.client.apiUrl),
-      });
+      const coldScope = this.deferInitialReflect;this.deferInitialReflect = undefined;
+      if (memoryScopeUnchanged(coldScope, this.cfg, this.client))
+        writeSessionCache(cacheFile, { deferInitialReflect: true, memoryScope: coldScope.fingerprint });
+      else diag(this.harness, "memory_cache_invalidated", { reason: "cold_scope_changed" });
     }
     const output = await buildHookOutput({
       harness: this.harness,
@@ -193,6 +195,12 @@ export class RuntimeCore {
       client: this.client,
       cacheFile,
     });
+    if (!output.memoryScope || !memoryScopeUnchanged(output.memoryScope, this.cfg, this.client)) {
+      this.injection.delete(sessionId);
+      const notice = output.memoryScope ? "Memory scope changed — pending memory discarded" : output.notice;
+      if (notice) this.notify?.("Hindsight", notice);
+      return;
+    }
 
     const blocks: string[] = [];
     // The SessionStart-equivalent preamble, injected once on the first turn (later turns get the
@@ -217,7 +225,7 @@ export class RuntimeCore {
       this.notify?.("Hindsight · recalled past decisions", preview);
     }
     const block = blocks.filter(Boolean).join("\n\n");
-    this.injection.set(sessionId, block);
+    this.injection.set(sessionId, { block, scope: output.memoryScope });
   }
 
   /**
@@ -233,7 +241,15 @@ export class RuntimeCore {
    * way any more.
    */
   getInjection(sessionId: string): string | undefined {
-    return this.injection.get(sessionId) || undefined;
+    const pending = this.injection.get(sessionId);
+    if (!pending) return undefined;
+    if (!memoryScopeUnchanged(pending.scope, this.cfg, this.client)) {
+      this.injection.delete(sessionId);
+      diag(this.harness, "memory_cache_invalidated", { reason: "scope_changed_before_delivery" });
+      this.notify?.("Hindsight", "Memory scope changed — pending memory discarded");
+      return undefined;
+    }
+    return pending.block || undefined;
   }
 
   /**

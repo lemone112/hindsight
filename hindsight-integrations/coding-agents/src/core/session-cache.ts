@@ -6,6 +6,7 @@ import type { RetainCursor, RetainCursorStore } from "./retain-cursor";
 import type { UsageCursorStore } from "./usage";
 import { createHash } from "node:crypto";
 import type { Config } from "./config";
+import { diag } from "./diag";
 
 /** Process-shared state for hook harnesses. SessionStart and prompt hooks are separate Node
  * processes, so this temp-file handoff carries lifecycle decisions without writing user config or
@@ -69,14 +70,17 @@ function readSessionCacheRecord(cacheFile: string): CacheRead {
 export function memoryScopeFingerprint(
   cfg: Config,
   bank: string | undefined,
-  apiUrl = cfg.apiUrl
+  apiUrl = cfg.apiUrl,
+  client?: { readonly apiToken?: string }
 ): string {
+  // Отсутствующий getter у минимального test client отличается от фактического anonymous.
+  const token = client && "apiToken" in client ? client.apiToken : cfg.apiToken;
   const body = JSON.stringify(
     {
       // Нормализация принадлежит HTTP-клиенту: его фактический endpoint сохраняется точно.
       endpoint: apiUrl,
       bank: bank ?? null,
-      credential: cfg.apiToken ?? null,
+      credential: token || null,
       daemonProfile: cfg.serverMode === "daemon" ? cfg.daemonProfile : null,
       autoInject: cfg.autoInject,
       observationScopes: cfg.observationScopes,
@@ -89,6 +93,41 @@ export function memoryScopeFingerprint(
         : value
   );
   return `v1:${createHash("sha256").update(body).digest("hex")}`;
+}
+
+export interface MemoryScopeClient {
+  readonly apiUrl?: string;
+  readonly apiToken?: string;
+  readonly credentialRevision?: number;
+  readonly bank?: string;
+}
+
+/** Поколение обнаруживает A→B→A во время await; в файл попадает только fingerprint. */
+export interface MemoryScopeSnapshot {
+  fingerprint: string;
+  credentialRevision?: number;
+}
+
+export function captureMemoryScope(
+  cfg: Config,
+  client: MemoryScopeClient,
+  bank = client.bank
+): MemoryScopeSnapshot {
+  return {
+    fingerprint: memoryScopeFingerprint(cfg, bank, client.apiUrl, client),
+    credentialRevision: client.credentialRevision,
+  };
+}
+
+export function memoryScopeUnchanged(
+  snapshot: MemoryScopeSnapshot,
+  cfg: Config,
+  client: MemoryScopeClient,
+  bank = client.bank
+): boolean {
+  const current = captureMemoryScope(cfg, client, bank);
+  return snapshot.fingerprint === current.fingerprint &&
+    snapshot.credentialRevision === current.credentialRevision;
 }
 
 /** Ни ответ, ни завершённая попытка, ни roster из другой области не должны подавить новое чтение. */
@@ -144,17 +183,35 @@ function pendingContextFile(harness: string, sessionId: string): string {
 
 /** Add a block to the session's pending context. A block already waiting is not added again, so a
  *  session that goes several turns without a tool call is not handed the same roster N times. */
-export function stashPendingContext(harness: string, sessionId: string, context: string): void {
-  const path = pendingContextFile(harness, sessionId);
-  let existing = "";
+function readPendingContext(harness: string, path: string, memoryScope: string): string | undefined {
+  let record: unknown;
   try {
-    existing = readFileSync(path, "utf8");
-  } catch {
-    /* nothing pending yet */
+    record = JSON.parse(readFileSync(path, "utf8"));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== "ENOENT")
+      diag(harness, "pending_context_invalidated", { reason: "invalid_or_legacy" });
+    return undefined;
   }
+  if (!record || typeof record !== "object" ||
+      typeof (record as { context?: unknown }).context !== "string" ||
+      typeof (record as { memoryScope?: unknown }).memoryScope !== "string") {
+    diag(harness, "pending_context_invalidated", { reason: "invalid_or_legacy" });
+    return undefined;
+  }
+  const pending = record as { context: string; memoryScope: string };
+  if (pending.memoryScope !== memoryScope) {
+    diag(harness, "pending_context_invalidated", { reason: "scope_mismatch" });
+    return undefined;
+  }
+  return pending.context;
+}
+
+export function stashPendingContext(harness: string, sessionId: string, context: string, memoryScope: string): void {
+  const path = pendingContextFile(harness, sessionId);
+  const existing = readPendingContext(harness, path, memoryScope) ?? "";
   if (existing.includes(context)) return;
   try {
-    writeFileAtomic(path, existing ? `${existing}\n\n${context}` : context);
+    writeFileAtomic(path, JSON.stringify({ memoryScope, context: existing ? `${existing}\n\n${context}` : context }));
   } catch {
     /* best-effort, like the session cache */
   }
@@ -162,12 +219,12 @@ export function stashPendingContext(harness: string, sessionId: string, context:
 
 /** Claim and clear the session's pending context. The rename is the claim: tool hooks can run in
  *  parallel, and only the one whose rename succeeds delivers the block. */
-export function takePendingContext(harness: string, sessionId: string): string | undefined {
+export function takePendingContext(harness: string, sessionId: string, memoryScope: string): string | undefined {
   const path = pendingContextFile(harness, sessionId);
   const claimed = `${path}.${process.pid}.claim`;
   try {
     renameSync(path, claimed);
-    return readFileSync(claimed, "utf8") || undefined;
+    return readPendingContext(harness, claimed, memoryScope) || undefined;
   } catch {
     return undefined;
   } finally {

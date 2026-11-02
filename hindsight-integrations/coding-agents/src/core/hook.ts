@@ -42,7 +42,8 @@ import {
 import type { PageRef } from "./knowledge-injection";
 import { buildRosterRefresh, parsePageList } from "./knowledge-injection";
 import {
-  memoryScopeFingerprint,
+  captureMemoryScope,
+  memoryScopeUnchanged,
   readScopedSessionCache,
   sessionCacheFile,
   sessionRootDir,
@@ -50,6 +51,8 @@ import {
   takePendingContext,
   writeSessionCache,
   type SessionCache,
+  type MemoryScopeClient,
+  type MemoryScopeSnapshot,
 } from "./session-cache";
 import { appendJournalTurn, journalPath } from "./turn-journal";
 
@@ -87,8 +90,7 @@ export interface HookSpec {
 }
 
 /** Minimal client shape `buildHookOutput` needs — `HindsightClient` satisfies it structurally. */
-interface HookClient {
-  readonly apiUrl?: string;
+interface HookClient extends MemoryScopeClient {
   reflect(query: string, opts: { budget?: string; timeoutMs: number }): Promise<string>;
   listPages(): Promise<unknown>;
   searchKnowledgePages(
@@ -216,6 +218,8 @@ async function reflectFallback(
 }
 
 export interface HookOutput {
+  /** Внутренний guard для отложенной доставки persistent host; не сериализуется в кэш. */
+  memoryScope?: MemoryScopeSnapshot;
   /** The model-facing injection block, or undefined when there's nothing to inject. */
   context?: string;
   /** User-facing line(s) — set only on the reflect turn (its goal + result preview). */
@@ -240,7 +244,8 @@ export async function buildHookOutput(args: {
 }): Promise<HookOutput> {
   const { harness, prompt, cfg, client, cacheFile } = args;
 
-  const memoryScope = memoryScopeFingerprint(cfg, client.bank, client.apiUrl);
+  const scope = captureMemoryScope(cfg, client);
+  const memoryScope = scope.fingerprint;
   const read = readScopedSessionCache(cacheFile, memoryScope);
   const cached = read.cache;
   if (read.status !== "valid" && read.status !== "missing")
@@ -262,6 +267,7 @@ export async function buildHookOutput(args: {
   let reflectFailed = false;
   // Set when reflect timed out / 5xx'd and a retrieval-only fallback supplied the memory instead.
   let fallback: string | null | undefined;
+  let reflectDiagnostic: { event: string; details: Record<string, unknown> } | undefined;
   const deferInitialReflect = cached.deferInitialReflect === true;
   if (deferInitialReflect) {
     // A new bank has no useful history yet. Do not burn the once-per-session synthesis on prompt
@@ -312,14 +318,15 @@ export async function buildHookOutput(args: {
         budget: "low",
         timeoutMs,
       });
-      diag(harness, reflectAnswer ? "reflect_ok" : "reflect_empty", {
+      // Ответ пишется в diagnostics только вместе с принятой доставкой после последнего await.
+      reflectDiagnostic = { event: reflectAnswer ? "reflect_ok" : "reflect_empty", details: {
         ms: Date.now() - t0,
         chars: reflectAnswer.length,
         query: prompt.slice(0, 80),
         // Verbatim injected synthesis — the ONLY durable record of what the agent actually saw
         // (post-mortems otherwise depend on the harness happening to persist hook context).
         answer: reflectAnswer.slice(0, 8000),
-      });
+      } };
     } catch (e) {
       // A failure is RETRYABLE, not an answer — `resolveInjection` leaves it unresolved until the
       // budget is spent. Caching "" here meant one timeout on the session's first prompt disabled
@@ -372,6 +379,12 @@ export async function buildHookOutput(args: {
     }
   }
 
+  if (!memoryScopeUnchanged(scope, cfg, client)) {
+    writeSessionCache(cacheFile, { memoryScope: captureMemoryScope(cfg, client).fingerprint });
+    diag(harness, "memory_cache_invalidated", { reason: "scope_changed_during_read" });
+    return { notice: `${brandWord()} · memory scope changed — no memory this turn`, pages: [] };
+  }
+  if (reflectDiagnostic) diag(harness, reflectDiagnostic.event, reflectDiagnostic.details);
   writeSessionCache(cacheFile, {
     memoryScope,
     turns,
@@ -429,7 +442,7 @@ export async function buildHookOutput(args: {
     notice = `${brandWord()} · no memory this turn — see ${diagFilePath()}`;
   }
 
-  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages };
+  return { context: kept.length ? kept.join("\n\n") : undefined, notice, pages, memoryScope: scope };
 }
 
 /** Run one hook invocation: stdin event in, (maybe) an injection object on stdout. */
@@ -444,16 +457,11 @@ export async function runHook(
   if (!ev) return;
   if (spec.accept && !spec.accept(ev)) return;
   const { prompt: rawPrompt, cwd: rawCwd, sessionId } = spec.parse(ev);
-  if (spec.toolHook?.accept(ev)) {
-    // Runs on every tool call, so it does nothing but hand over what a prompt hook stashed.
-    const pending = sessionId ? takePendingContext(spec.harness, sessionId) : undefined;
-    if (pending) process.stdout.write(JSON.stringify(spec.toolHook.emit(pending)));
-    return;
-  }
+  const isToolHook = spec.toolHook?.accept(ev) === true;
   if (spec.requireCwd && !rawCwd) return;
   const cwd = rawCwd || process.cwd();
   const prompt = (rawPrompt || "").trim();
-  if (!prompt) return;
+  if (!prompt && !isToolHook) return;
 
   let cfg = loadConfig({ harness: spec.harness });
   setLogLevel(cfg.logLevel);
@@ -466,7 +474,7 @@ export async function runHook(
   // session's only record of what the user said, and a slow or unreachable server must not be able
   // to cost the turn. Journaling under `retainSessions: false` writes a temp file nothing reads,
   // which is cheaper than threading that decision through two processes to find out.
-  if (spec.journalPrompt) {
+  if (spec.journalPrompt && !isToolHook) {
     appendJournalTurn(journalPath(spec.harness, sessionId), { role: "user", content: prompt });
   }
 
@@ -492,6 +500,13 @@ export async function runHook(
     pageSearchLimit: cfg.pageSearchLimit,
     recallOptions: cfg.recallOptions,
   });
+  if (isToolHook) {
+    // Тот же локальный resolver, без HTTP: чужая область не наследует отложенный контекст.
+    const scope = captureMemoryScope(cfg, client, bankId);
+    const pending = sessionId ? takePendingContext(spec.harness, sessionId, scope.fingerprint) : undefined;
+    if (pending) process.stdout.write(JSON.stringify(spec.toolHook!.emit(pending)));
+    return;
+  }
   const cacheFile = sessionCacheFile(spec.harness, sessionId || "no-session");
 
   // Safety net on EVERY harness: on the session's FIRST prompt (no cache file yet), fire the
@@ -503,6 +518,12 @@ export async function runHook(
   }
 
   const output = await buildHookOutput({ harness: spec.harness, prompt, cfg, client, cacheFile });
+  if (output.memoryScope && !memoryScopeUnchanged(output.memoryScope, cfg, client)) {
+    writeSessionCache(cacheFile, { memoryScope: captureMemoryScope(cfg, client).fingerprint });
+    output.context = undefined;output.pages = [];output.memoryScope = undefined;
+    output.notice = `${brandWord()} · memory scope changed — no memory this turn`;
+    diag(spec.harness, "memory_cache_invalidated", { reason: "scope_changed_before_delivery" });
+  }
   // Mid-session heal: a bank with ZERO pages means the engine never built it (e.g. the session
   // predates the install, so no SessionStart and the first-prompt net already passed). Fire the
   // idempotent engine — the per-bank lock makes repeats free while it builds.
@@ -515,7 +536,7 @@ export async function runHook(
   }
   let context = output.context;
   if (context && spec.toolHook && sessionId) {
-    stashPendingContext(spec.harness, sessionId, context);
+    stashPendingContext(spec.harness, sessionId, context, output.memoryScope!.fingerprint);
     context = undefined;
   }
   if (context || output.notice) out(context, output.notice);

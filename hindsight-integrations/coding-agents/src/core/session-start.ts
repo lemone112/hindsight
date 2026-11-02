@@ -41,16 +41,17 @@ import { detectLegacyClaudePlugin, legacyClaudePluginWarning } from "./legacy";
 import { HindsightClient } from "./hindsight";
 import {
   sessionCacheFile,
-  memoryScopeFingerprint,
+  captureMemoryScope,
+  memoryScopeUnchanged,
   readScopedSessionCache,
   sessionRootDir,
   stashPendingContext,
   writeSessionCache,
+  type MemoryScopeClient,
 } from "./session-cache";
 
 /** Minimal client shape `buildSessionStartContext` needs. */
-interface SeedContextClient {
-  readonly apiUrl?: string;
+interface SeedContextClient extends MemoryScopeClient {
   listDocumentIds(tag: string, tagsMatch?: "all" | "all_strict"): Promise<Set<string>>;
   // Optional: lets the git note see a git-log document written at a commit HEAD is behind
   // (gitLogIsCurrent). The minimal test clients omit it and keep the exact-HEAD check.
@@ -183,6 +184,7 @@ export async function buildSessionStartContext(args: {
   detectLegacyPlugin?: (cwd: string) => string | undefined;
 }): Promise<SessionStartOutput> {
   const { cwd, bankId, cfg, client, stateDir } = args;
+  const scope = captureMemoryScope(cfg, client, bankId);
   const t0 = Date.now();
   let cold: boolean | undefined; // undefined = not checked (autoSeed off / non-git / unreachable)
   let gitDocIds: Set<string> | undefined; // the cold-check's doc set, reused by the banner's git note
@@ -391,6 +393,11 @@ export async function buildSessionStartContext(args: {
   // ALWAYS record the session start (warm sessions used to log nothing — undebuggable).
   diag(harness, "session_start", { bank: bankId, cold, pages: pages.length, ms: Date.now() - t0 });
 
+  if (!memoryScopeUnchanged(scope, cfg, client, bankId)) {
+    diag(harness, "memory_cache_invalidated", { reason: "scope_changed_during_session_start" });
+    return { systemMessage: `${brandWord()} · memory scope changed — no memory this session start` };
+  }
+
   return { systemMessage, additionalContext, deferInitialReflect };
 }
 
@@ -449,11 +456,18 @@ export async function runSessionStartHook(
       observationScopes: cfg.observationScopes,
     });
 
+    const scope = captureMemoryScope(cfg, client, bankId);
     const out = await buildSessionStartContext({ cwd, sessionRoot, bankId, cfg, client, harness });
-    const memoryScope = memoryScopeFingerprint(cfg, bankId, client.apiUrl);
+    const stable = memoryScopeUnchanged(scope, cfg, client, bankId);
+    const memoryScope = scope.fingerprint;
     const cacheFile = sessionId ? sessionCacheFile(harness, sessionId) : undefined;
-    const read = cacheFile ? readScopedSessionCache(cacheFile, memoryScope) : undefined;
-    if (source === "compact") {
+    const read = stable && cacheFile ? readScopedSessionCache(cacheFile, memoryScope) : undefined;
+    if (!stable) {
+      out.additionalContext = undefined;out.deferInitialReflect = false;
+      out.systemMessage = `${brandWord()} · memory scope changed — no memory this session start`;
+      if (cacheFile) writeSessionCache(cacheFile, { memoryScope: captureMemoryScope(cfg, client, bankId).fingerprint });
+      diag(harness, "memory_cache_invalidated", { reason: "scope_changed_during_session_start" });
+    } else if (source === "compact") {
       const answer = read?.cache.reflectAnswer;
       const reason = cfg.autoInject === "none" ? "auto_inject_off"
         : !sessionId ? "no_session"
@@ -488,7 +502,7 @@ export async function runSessionStartHook(
       });
     }
     if (spec.deferContextToToolHook && out.additionalContext && sessionId) {
-      stashPendingContext(harness, sessionId, out.additionalContext);
+      stashPendingContext(harness, sessionId, out.additionalContext, memoryScope);
       out.additionalContext = undefined;
     }
     // The lifecycle computes one host-neutral output; the registry owns each host's wire schema.

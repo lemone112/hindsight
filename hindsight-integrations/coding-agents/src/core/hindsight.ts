@@ -364,6 +364,7 @@ export class HindsightClient {
   /** The credential the NEXT request will sign with — NOT the one the config file holds. The two
    *  diverge exactly when #3600 bites, which is why `hindsight_diagnose` reports both. */
   private token: string | undefined;
+  private tokenRevision = 0;
   private readonly tokenProvider?: () => string | undefined;
   readonly bank: string;
   readonly project?: string;
@@ -401,6 +402,11 @@ export class HindsightClient {
     return this.token;
   }
 
+  /** Только для незавершённого чтения: стабильный кэш не зависит от жизни процесса. */
+  get credentialRevision(): number {
+    return this.tokenRevision;
+  }
+
   private headers(): Record<string, string> {
     // `identity`: the server gzips bodies >= 1 KB, and some hosts (DSH runs plugins on its own
     // fetch) hand back the compressed bytes undecoded, so `.json()` dies on the gzip magic (#4868).
@@ -426,6 +432,7 @@ export class HindsightClient {
     }
     if (next === this.token) return false;
     this.token = next;
+    this.tokenRevision++;
     return true;
   }
 
