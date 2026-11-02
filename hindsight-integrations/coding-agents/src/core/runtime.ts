@@ -247,6 +247,10 @@ export class RuntimeCore {
   getInjection(sessionId: string): string | undefined {
     const pending = this.injection.get(sessionId);
     if (!pending) return undefined;
+    if (this.client.credentialRejected) {
+      diag(this.harness, "memory_cache_not_delivered", { reason: "credential_rejected" });
+      return undefined;
+    }
     if (!memoryScopeUnchanged(pending.scope, this.cfg, this.client)) {
       this.injection.delete(sessionId);
       diag(this.harness, "memory_cache_invalidated", { reason: "scope_changed_before_delivery" });

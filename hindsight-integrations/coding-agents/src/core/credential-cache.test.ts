@@ -267,6 +267,31 @@ describe("effective credential cache", () => {
     expect(c.credentialRejected).toBe(false);
     expect(runtime.getContextMemory(session, [])).toContain(FACT_A);
   });
+  it("blocks pending prompt delivery after same-key search 200 then roster 401 and permits protected recovery", async () => {
+    const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);
+    onFetch = (url) => url.endsWith("/knowledge-base/tree")
+      ? Promise.resolve(new Response("{}", { status: 401 })) : undefined;
+    await runtime.onPrompt(session, "Read accepted facts");
+    expect(calls.map(({ url }) => new URL(url).pathname)).toEqual([
+      "/v1/default/banks/test-bank/knowledge-base/search", "/v1/default/banks/test-bank/knowledge-base/tree",
+    ]);
+    expect(c.credentialRevision).toBe(0);
+    expect(c.credentialRejected).toBe(true);
+    expect(runtime.getInjection(session)).toBeUndefined();
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    onFetch = (url) => url.endsWith("/health") || url.endsWith("/version") || url.endsWith("/mcp")
+      ? Promise.resolve(Response.json({ public: true })) : undefined;
+    for (const suffix of ["/health", "/version", "/mcp"]) await c.req("GET", c.apiUrl + suffix);
+    expect(c.credentialRejected).toBe(true);
+    expect(runtime.getInjection(session)).toBeUndefined();
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    onFetch = undefined;await c.req("GET", c.bankUrl("/knowledge-base/tree"));
+    expect(c.credentialRejected).toBe(false);
+    const beforeDelivery = calls.length;
+    expect(runtime.getInjection(session)).toContain(FACT_A);
+    expect(runtime.getContextMemory(session, [])).toContain(FACT_A);
+    expect(calls).toHaveLength(beforeDelivery);
+  });
   it("a delayed old success cannot clear a later known own-bank rejection", async () => {
     const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);
     await runtime.onPrompt(session, "Read accepted facts");
