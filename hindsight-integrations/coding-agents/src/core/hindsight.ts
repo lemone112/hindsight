@@ -365,7 +365,7 @@ export class HindsightClient {
    *  diverge exactly when #3600 bites, which is why `hindsight_diagnose` reports both. */
   private token: string | undefined;
   private tokenRevision = 0;
-  private tokenRejected = false;
+  private bankAccess: "unknown" | "accepted" | "rejected" = "unknown";
   private rejectionRevision = 0;
   private readonly tokenProvider?: () => string | undefined;
   readonly bank: string;
@@ -411,7 +411,12 @@ export class HindsightClient {
 
   /** Известный 401 текущего поколения запрещает повторную выдачу его cached context. */
   get credentialRejected(): boolean {
-    return this.tokenRejected;
+    return this.bankAccess === "rejected";
+  }
+
+  /** Новый клиент подтверждает собственный банк до выдачи persisted cache. */
+  get bankAccessConfirmed(): boolean {
+    return this.bankAccess === "accepted";
   }
 
   private headers(): Record<string, string> {
@@ -440,7 +445,7 @@ export class HindsightClient {
     if (next === this.token) return false;
     this.token = next;
     this.tokenRevision++;
-    this.tokenRejected = false;
+    this.bankAccess = "unknown";
     return true;
   }
 
@@ -467,9 +472,9 @@ export class HindsightClient {
       // Поздний ответ старого запроса не отзывает и не восстанавливает новое поколение.
       if (protectedBankRequest && revision === this.tokenRevision) {
         if (response.status === 401) {
-          this.tokenRejected = true;
+          this.bankAccess = "rejected";
           this.rejectionRevision++;
-        } else if (response.ok && rejection === this.rejectionRevision) this.tokenRejected = false;
+        } else if (response.ok && rejection === this.rejectionRevision) this.bankAccess = "accepted";
       }
       return response;
     };

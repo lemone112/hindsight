@@ -216,7 +216,7 @@ describe("effective credential cache", () => {
     desired = accepted = A;await c.req("GET", c.bankUrl("/probe-a"));
     expect(runtime.getInjection(session)).toBeUndefined();
   });
-  it("restores the exact same-scope answer after compact and client reconstruction without retrieval", async () => {
+  it("restores the same-scope answer without retrieval once the reconstructed client confirms own-bank access", async () => {
     const c = client();const cfg = resolveConfig(rawConfig);
     const runtime = new RuntimeCore(c, "test-bank", cfg, "claude-code", root);
     await runtime.onPrompt(session, "Read accepted facts");
@@ -227,9 +227,13 @@ describe("effective credential cache", () => {
     expect(restored).toContain(FACT_A);
     expect(restored).toContain("no new memory query");
     expect(runtime.getContextMemory(session, [restored!])).toBeUndefined();
-    const restarted = new RuntimeCore(client(), "test-bank", cfg, "claude-code", root);
-    expect(restarted.getContextMemory(session, ["incomplete summary"])).toContain(FACT_A);
+    const restartedClient = client();
+    const restarted = new RuntimeCore(restartedClient, "test-bank", cfg, "claude-code", root);
+    expect(restarted.getContextMemory(session, ["incomplete summary"])).toBeUndefined();
     expect(calls).toHaveLength(before);
+    await restartedClient.req("GET", restartedClient.bankUrl("/knowledge-base/tree"));
+    expect(restarted.getContextMemory(session, ["incomplete summary"])).toContain(FACT_A);
+    expect(calls).toHaveLength(before + 1);
   });
   it("does not restore another bank, endpoint or effective credential's answer", async () => {
     const c = client();const cfg = resolveConfig(rawConfig);
@@ -291,6 +295,24 @@ describe("effective credential cache", () => {
     expect(runtime.getInjection(session)).toContain(FACT_A);
     expect(runtime.getContextMemory(session, [])).toContain(FACT_A);
     expect(calls).toHaveLength(beforeDelivery);
+  });
+  it("does not restore a rejected disk answer after reconstruction until own-bank access is accepted", async () => {
+    const cfg = resolveConfig(rawConfig);
+    const c = client();const runtime = new RuntimeCore(c, "test-bank", cfg, "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    accepted = B;await expect(c.req("GET", c.bankUrl("/probe"))).rejects.toThrow(/401/);
+    const restartedClient = client();
+    const restarted = new RuntimeCore(restartedClient, "test-bank", cfg, "claude-code", root);
+    expect(restarted.getContextMemory(session, [])).toBeUndefined();
+    onFetch = (url) => url.endsWith("/health") || url.endsWith("/version") || url.endsWith("/mcp")
+      ? Promise.resolve(Response.json({ public: true })) : undefined;
+    for (const suffix of ["/health", "/version", "/mcp"]) await restartedClient.req("GET", restartedClient.apiUrl + suffix);
+    expect(restarted.getContextMemory(session, [])).toBeUndefined();
+    onFetch = undefined;
+    await expect(restartedClient.req("GET", restartedClient.bankUrl("/probe"))).rejects.toThrow(/401/);
+    expect(restarted.getContextMemory(session, [])).toBeUndefined();
+    accepted = A;await restartedClient.req("GET", restartedClient.bankUrl("/knowledge-base/tree"));
+    expect(restarted.getContextMemory(session, [])).toContain(FACT_A);
   });
   it("a delayed old success cannot clear a later known own-bank rejection", async () => {
     const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);

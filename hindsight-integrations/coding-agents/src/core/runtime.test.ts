@@ -35,6 +35,7 @@ describe("RuntimeCore", () => {
       listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
       listPages: vi.fn(async () => ({ items: [] })),
       reflect: vi.fn(async () => "shared reflect"),
+      bankAccessConfirmed: true,
     } as unknown as HindsightClient;
     const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
 
@@ -59,6 +60,7 @@ describe("RuntimeCore", () => {
       listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
       listPages: vi.fn(async () => ({ items: [] })),
       reflect: vi.fn(async () => "a memory"),
+      bankAccessConfirmed: true,
     } as unknown as HindsightClient;
     const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
 
@@ -81,6 +83,7 @@ describe("RuntimeCore", () => {
       listDocumentIds: vi.fn(async () => new Set(["git:existing"])),
       listPages: vi.fn(async () => ({ items: pages })),
       reflect: vi.fn(async () => ""),
+      bankAccessConfirmed: true,
     } as unknown as HindsightClient;
     const runtime = new RuntimeCore(client, "bank-1", resolveConfig({}));
 

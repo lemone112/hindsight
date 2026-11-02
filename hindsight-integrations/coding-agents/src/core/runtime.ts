@@ -247,8 +247,8 @@ export class RuntimeCore {
   getInjection(sessionId: string): string | undefined {
     const pending = this.injection.get(sessionId);
     if (!pending) return undefined;
-    if (this.client.credentialRejected) {
-      diag(this.harness, "memory_cache_not_delivered", { reason: "credential_rejected" });
+    if (!this.client.bankAccessConfirmed) {
+      diag(this.harness, "memory_cache_not_delivered", { reason: "bank_access_unconfirmed" });
       return undefined;
     }
     if (!memoryScopeUnchanged(pending.scope, this.cfg, this.client)) {
@@ -263,8 +263,8 @@ export class RuntimeCore {
   /** Восстанавливает точный ответ, если compact удалил его из текущего model context. */
   getContextMemory(sessionId: string, texts: readonly string[]): string | undefined {
     if (process.env.HINDSIGHT_DISABLE_HOOKS || this.cfg.autoInject === "none") return;
-    if (this.client.credentialRejected) {
-      diag(this.harness, "context_memory_not_restored", { reason: "credential_rejected" });
+    if (!this.client.bankAccessConfirmed) {
+      diag(this.harness, "context_memory_not_restored", { reason: "bank_access_unconfirmed" });
       return;
     }
     // Новый процесс может читать стабильный disk cache. В текущем процессе поздний A→B→A
