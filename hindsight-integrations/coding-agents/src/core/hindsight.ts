@@ -365,6 +365,8 @@ export class HindsightClient {
    *  diverge exactly when #3600 bites, which is why `hindsight_diagnose` reports both. */
   private token: string | undefined;
   private tokenRevision = 0;
+  private tokenRejected = false;
+  private rejectionRevision = 0;
   private readonly tokenProvider?: () => string | undefined;
   readonly bank: string;
   readonly project?: string;
@@ -407,6 +409,11 @@ export class HindsightClient {
     return this.tokenRevision;
   }
 
+  /** Известный 401 текущего поколения запрещает повторную выдачу его cached context. */
+  get credentialRejected(): boolean {
+    return this.tokenRejected;
+  }
+
   private headers(): Record<string, string> {
     // `identity`: the server gzips bodies >= 1 KB, and some hosts (DSH runs plugins on its own
     // fetch) hand back the compressed bytes undecoded, so `.json()` dies on the gzip magic (#4868).
@@ -433,6 +440,7 @@ export class HindsightClient {
     if (next === this.token) return false;
     this.token = next;
     this.tokenRevision++;
+    this.tokenRejected = false;
     return true;
   }
 
@@ -450,8 +458,21 @@ export class HindsightClient {
   private async fetchWithAuth(url: string, init: RequestInit): Promise<Response> {
     // Only a request with its own deadline drops undici's timeouts; the drain poll has none.
     const dispatcher = init.signal ? signalOnlyDispatcher() : undefined;
-    const send = () =>
-      fetch(url, { ...init, headers: this.headers(), ...(dispatcher ? { dispatcher } : {}) });
+    const bankUrl = this.bankUrl();
+    const protectedBankRequest = url === bankUrl || url.startsWith(bankUrl + "/");
+    const send = async () => {
+      const revision = this.tokenRevision;
+      const rejection = this.rejectionRevision;
+      const response = await fetch(url, { ...init, headers: this.headers(), ...(dispatcher ? { dispatcher } : {}) });
+      // Поздний ответ старого запроса не отзывает и не восстанавливает новое поколение.
+      if (protectedBankRequest && revision === this.tokenRevision) {
+        if (response.status === 401) {
+          this.tokenRejected = true;
+          this.rejectionRevision++;
+        } else if (response.ok && rejection === this.rejectionRevision) this.tokenRejected = false;
+      }
+      return response;
+    };
     const r = await send();
     if (r.status !== 401 || !this.refreshToken()) return r;
     return send();

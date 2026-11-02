@@ -204,6 +204,18 @@ export async function wireOpencode2Runtime(
     }
   });
 
+  // Context вызывается и после compact, и при продолжении того же turn без prompt hook.
+  // Добавление остаётся в user context; system prefix и существующие сообщения не меняются.
+  await ctx.session.hook("context", (input) => {
+    const texts = input.messages.flatMap((message) =>
+      message.content.flatMap((part) => part.type === "text" ? [part.text] : [])
+    );
+    const restored = core.getContextMemory(input.sessionID, texts);
+    if (restored) {
+      input.messages.unshift({ role: "user", content: [{ type: "text", text: restored }] });
+    }
+  });
+
   // Write-back (on by default). Refetching on idle — rather than replaying the list the context
   // hook saw — is the whole point: that list is built BEFORE the reply, so it always lags a turn
   // and a session's final exchange would never be retained.

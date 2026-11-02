@@ -13,6 +13,8 @@ import type { ToolSpec } from "../core/knowledge-tools";
 import { wireOpencode2Runtime } from "./opencode2";
 
 type PromptHook = (input: { sessionID: string; prompt?: { text?: string } }) => Promise<void>;
+type ContextHook = (input: { sessionID: string; messages: { role: string; content: { type: string; text?: string }[] }[];
+  system: unknown[]; tools: Record<string, unknown>; options: Record<string, unknown> }) => void;
 type ToolDraft = { add(tool: Record<string, unknown>): void };
 
 /**
@@ -38,6 +40,7 @@ function fakeContext() {
     synthetics,
     hooks,
     prompt: () => hooks.prompt as PromptHook,
+    context: () => hooks.context as ContextHook,
     /** Deliver events to the adapter's subscription, then let its loop drain. */
     async emit(...events: unknown[]) {
       for (const e of events) {
@@ -112,6 +115,7 @@ function fakeCore(overrides: Partial<Record<string, unknown>> = {}) {
     setTranscriptSource: vi.fn(),
     onPrompt: vi.fn(async () => {}),
     getInjection: vi.fn(() => "<hindsight_memories>remember</hindsight_memories>"),
+    getContextMemory: vi.fn(() => undefined),
     onSessionIdle: vi.fn(async () => {}),
     ...overrides,
   };
@@ -178,8 +182,7 @@ describe("opencode2 adapter", () => {
   });
 
   it("adds this turn's injection as a synthetic message, never to the system prompt", async () => {
-    // The block changes between turns, so a system prompt carrying it broke the provider's prefix
-    // cache (#5914). No `context` hook means nothing of ours can reach the system prompt.
+    // Меняющийся блок остаётся synthetic user message: system prefix сохраняется.
     const fake = fakeContext();
     const core = fakeCore();
     await wireOpencode2Runtime(core, fake.ctx);
@@ -193,7 +196,33 @@ describe("opencode2 adapter", () => {
         resume: false,
       },
     ]);
-    expect(fake.hooks.context).toBeUndefined();
+    expect(typeof fake.hooks.context).toBe("function");
+  });
+
+  it("restores cached memory in model context without a prompt and preserves the request", async () => {
+    const fake = fakeContext();
+    const core = fakeCore({ getContextMemory: vi.fn(() => "<hindsight_memory>exact fact</hindsight_memory>") });
+    await wireOpencode2Runtime(core, fake.ctx);
+    const first = { role: "user", content: [{ type: "text", text: "incomplete summary" }] };
+    const last = { role: "tool", content: [{ type: "tool-result", text: "result" }] };
+    const input = { sessionID: "ses_resumed", messages: [first, last], system: [{ text: "original" }],
+      tools: { read: {} }, options: { maxTokens: 1200 } };
+    const system = input.system, tools = input.tools, options = input.options;
+    fake.context()(input);
+    expect(core.onPrompt).not.toHaveBeenCalled();
+    expect(core.getContextMemory).toHaveBeenCalledWith("ses_resumed", ["incomplete summary"]);
+    expect(input.messages).toHaveLength(3);
+    expect(input.messages[0]).toEqual({ role: "user", content: [{ type: "text", text: "<hindsight_memory>exact fact</hindsight_memory>" }] });
+    expect(input.messages[1]).toBe(first);expect(input.messages[2]).toBe(last);
+    expect(input.system).toBe(system);expect(input.tools).toBe(tools);expect(input.options).toBe(options);
+    expect(fake.synthetics).toEqual([]);
+  });
+
+  it("leaves active model context untouched when no restoration is eligible", async () => {
+    const fake = fakeContext();await wireOpencode2Runtime(fakeCore(), fake.ctx);
+    const messages = [{ role: "user", content: [{ type: "text", text: "already contains memory" }] }];
+    fake.context()({ sessionID: "ses_1", messages, system: [], tools: {}, options: {} });
+    expect(messages).toHaveLength(1);
   });
 
   it("adds no message when there is nothing to inject", async () => {

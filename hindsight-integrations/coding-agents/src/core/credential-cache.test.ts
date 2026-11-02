@@ -216,6 +216,89 @@ describe("effective credential cache", () => {
     desired = accepted = A;await c.req("GET", c.bankUrl("/probe-a"));
     expect(runtime.getInjection(session)).toBeUndefined();
   });
+  it("restores the exact same-scope answer after compact and client reconstruction without retrieval", async () => {
+    const c = client();const cfg = resolveConfig(rawConfig);
+    const runtime = new RuntimeCore(c, "test-bank", cfg, "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    const original = runtime.getInjection(session)!;
+    expect(runtime.getContextMemory(session, [original])).toBeUndefined();
+    const before = calls.length;
+    const restored = runtime.getContextMemory(session, ["incomplete summary"]);
+    expect(restored).toContain(FACT_A);
+    expect(restored).toContain("no new memory query");
+    expect(runtime.getContextMemory(session, [restored!])).toBeUndefined();
+    const restarted = new RuntimeCore(client(), "test-bank", cfg, "claude-code", root);
+    expect(restarted.getContextMemory(session, ["incomplete summary"])).toContain(FACT_A);
+    expect(calls).toHaveLength(before);
+  });
+  it("does not restore another bank, endpoint or effective credential's answer", async () => {
+    const c = client();const cfg = resolveConfig(rawConfig);
+    const runtime = new RuntimeCore(c, "test-bank", cfg, "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    for (const opts of [{ apiUrl: c.apiUrl, bank: "other-bank" }, { apiUrl: "http://other.invalid", bank: c.bank }]) {
+      const foreign = new HindsightClient({ ...opts, apiToken: A });
+      expect(new RuntimeCore(foreign, opts.bank, cfg, "claude-code", root).getContextMemory(session, [])).toBeUndefined();
+    }
+    desired = accepted = B;await c.req("GET", c.bankUrl("/probe"));
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    expect(new RuntimeCore(c, "test-bank", cfg, "claude-code", root).getContextMemory(session, [])).toBeUndefined();
+    await runtime.onPrompt(session, "Read accepted facts again");
+    expect(runtime.getContextMemory(session, [])).toContain(FACT_B);
+  });
+  it("refuses late ABA context delivery even after the pending prompt block was removed", async () => {
+    const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    desired = accepted = B;await c.req("GET", c.bankUrl("/probe-b"));
+    desired = accepted = A;await c.req("GET", c.bankUrl("/probe-a"));
+    expect(runtime.getInjection(session)).toBeUndefined();
+    expect(runtime.getContextMemory(session, ["incomplete summary"])).toBeUndefined();
+  });
+  it("keeps unchanged-key 401 denied after public 200 and recovers on accepted own-bank access", async () => {
+    const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    accepted = B;await expect(c.req("GET", c.bankUrl("/probe"))).rejects.toThrow(/401/);
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    onFetch = (url) => url.endsWith("/health") || url.endsWith("/version") || url.endsWith("/mcp")
+      ? Promise.resolve(Response.json({ public: true })) : undefined;
+    for (const suffix of ["/health", "/version", "/mcp"]) await c.req("GET", c.apiUrl + suffix);
+    expect(c.credentialRejected).toBe(true);
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    accepted = A;await c.req("GET", c.bankUrl("/probe-recovered"));
+    expect(c.credentialRejected).toBe(false);
+    expect(runtime.getContextMemory(session, [])).toContain(FACT_A);
+  });
+  it("a delayed old success cannot clear a later known own-bank rejection", async () => {
+    const c = client();const runtime = new RuntimeCore(c, "test-bank", resolveConfig(rawConfig), "claude-code", root);
+    await runtime.onPrompt(session, "Read accepted facts");
+    let started!: () => void, release!: () => void;
+    const reached = new Promise<void>(r => started = r), pending = new Promise<void>(r => release = r);
+    onFetch = async (url) => {
+      if (!url.endsWith("/slow-success")) return undefined;
+      started();await pending;return Response.json({ accepted: true });
+    };
+    const old = c.req("GET", c.bankUrl("/slow-success"));await reached;
+    accepted = B;await expect(c.req("GET", c.bankUrl("/denied"))).rejects.toThrow(/401/);
+    release();await old;
+    expect(c.credentialRejected).toBe(true);
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+  });
+  it("does not restore disabled, unresolved, empty, legacy or malformed context cache", async () => {
+    const c = client();const cfg = resolveConfig(rawConfig);
+    const runtime = new RuntimeCore(c, "test-bank", cfg, "claude-code", root);
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    await runtime.onPrompt(session, "Read accepted facts");
+    for (const value of [undefined, "", "   "]) {
+      writeSessionCache(cache(), { memoryScope: memoryScopeFingerprint(cfg, c.bank, c.apiUrl, c), reflectAnswer: value });
+      expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    }
+    writeSessionCache(cache(), { reflectAnswer: FACT_A });
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    writeSessionCache(cache(), { memoryScope: memoryScopeFingerprint(cfg, c.bank, c.apiUrl, c), reflectAnswer: 42 } as never);
+    expect(runtime.getContextMemory(session, [])).toBeUndefined();
+    writeSessionCache(cache(), { memoryScope: memoryScopeFingerprint(cfg, c.bank, c.apiUrl, c), reflectAnswer: FACT_A });
+    expect(new RuntimeCore(c, "test-bank", resolveConfig({ ...rawConfig, autoInject: "none" }), "claude-code", root).getContextMemory(session, [])).toBeUndefined();
+    vi.stubEnv("HINDSIGHT_DISABLE_HOOKS", "1");expect(runtime.getContextMemory(session, [])).toBeUndefined();
+  });
   it("does not record a reflect answer as delivered if the later roster await changes credential", async () => {
     rawConfig = { ...rawConfig, autoInject: "reflect" };
     const c = client();c.reflect = vi.fn(async () => FACT_A);

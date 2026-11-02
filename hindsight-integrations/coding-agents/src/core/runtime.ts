@@ -32,8 +32,9 @@ import { buildRetainStamp } from "./retain-stamp";
 import { buildSessionStartContext } from "./session-start";
 import { syncCompanionSkill } from "./skill-sync";
 import { buildHookOutput } from "./hook";
+import { buildSystemInjection } from "./inject";
 import { captureMemoryScope, memoryScopeUnchanged, sessionCacheFile, writeSessionCache,
-  type MemoryScopeSnapshot } from "./session-cache";
+  readScopedSessionCache, type MemoryScopeSnapshot } from "./session-cache";
 
 const HARNESS = "opencode";
 /** How long `flush` holds a host's exit for in-flight write-backs: room for one retain request. */
@@ -42,6 +43,8 @@ const FLUSH_TIMEOUT_MS = 10_000;
 export class RuntimeCore {
   private readonly injection = new Map<string, { block: string; scope: MemoryScopeSnapshot }>();
   private readonly turnCount = new Map<string, number>(); // sessionId -> user-turn counter (cadence)
+  /** Поколение prompt остаётся проверяемым, даже когда getInjection уже отозвал его блок. */
+  private readonly promptScopes = new Map<string, MemoryScopeSnapshot>();
   private readonly sessionState = new Map<string, { startTs: string; retainedTurns: number }>();
   /** Live write-back cursors. In memory, unlike the hook harnesses': this host outlives the session. */
   private readonly cursors = memoryCursorStore();
@@ -176,6 +179,7 @@ export class RuntimeCore {
       this.injection.delete(sessionId);
       return;
     }
+    this.promptScopes.set(sessionId, captureMemoryScope(this.cfg, this.client));
     const turns = (this.turnCount.get(sessionId) ?? 0) + 1;
     this.turnCount.set(sessionId, turns);
 
@@ -250,6 +254,31 @@ export class RuntimeCore {
       return undefined;
     }
     return pending.block || undefined;
+  }
+
+  /** Восстанавливает точный ответ, если compact удалил его из текущего model context. */
+  getContextMemory(sessionId: string, texts: readonly string[]): string | undefined {
+    if (process.env.HINDSIGHT_DISABLE_HOOKS || this.cfg.autoInject === "none") return;
+    if (this.client.credentialRejected) {
+      diag(this.harness, "context_memory_not_restored", { reason: "credential_rejected" });
+      return;
+    }
+    // Новый процесс может читать стабильный disk cache. В текущем процессе поздний A→B→A
+    // не должен оживить блок, полученный незавершённым prompt прежнего поколения.
+    const scope = this.promptScopes.get(sessionId) ?? captureMemoryScope(this.cfg, this.client);
+    if (!memoryScopeUnchanged(scope, this.cfg, this.client)) {
+      diag(this.harness, "context_memory_not_restored", { reason: "scope_changed" });
+      return;
+    }
+    const read = readScopedSessionCache(sessionCacheFile(this.harness, sessionId), scope.fingerprint);
+    const answer = read.cache.reflectAnswer;
+    if (read.status !== "valid" || !answer?.trim()) return;
+    if (texts.some((text) => text.includes(answer))) return;
+    if (!memoryScopeUnchanged(scope, this.cfg, this.client)) return;
+    diag(this.harness, "context_memory_restored", { chars: answer.length });
+    return buildSystemInjection(
+      "(Restored from this session's earlier retrieval; no new memory query.)\n" + answer
+    );
   }
 
   /**
